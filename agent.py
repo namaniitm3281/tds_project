@@ -2,10 +2,10 @@
 Data-analyst agent.
 
 Given a conversation (list of {"role": "user"/"assistant", "content": str}),
-the agent uses Claude with a sandboxed python-execution tool to research,
-fetch data (MOSPI / any public dataset), compute an answer, and return a
-JSON-serializable python object for the "answer" field -- shaped exactly
-how the incoming question asked.
+the agent uses an LLM (via AI Pipe, OpenAI-compatible) with a sandboxed
+python-execution tool to research, fetch data (MOSPI / any public dataset),
+compute an answer, and return a JSON-serializable python object for the
+"answer" field -- shaped exactly how the incoming question asked.
 
 Every step (tool calls, tool results, final answer) is appended to a JSONL
 log file so a full audit trail is available at LOG_PATH.
@@ -17,10 +17,16 @@ import tempfile
 import time
 import uuid
 
-from anthropic import Anthropic
+from openai import OpenAI
 
-MODEL = "claude-sonnet-4-6"
-CLIENT = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# AI Pipe: OpenAI-compatible endpoint. Set AIPIPE_TOKEN in env.
+# Check https://aipipe.org/ for the current base_url and model names
+# available to you -- adjust AIPIPE_BASE_URL / AIPIPE_MODEL if different.
+MODEL = os.environ.get("AIPIPE_MODEL", "openai/gpt-4.1-mini")
+CLIENT = OpenAI(
+    api_key=os.environ["AIPIPE_TOKEN"],
+    base_url=os.environ.get("AIPIPE_BASE_URL", "https://aipipe.org/openrouter/v1"),
+)
 
 SYSTEM_PROMPT = """You are a rigorous data analyst agent answering one question at a time.
 
@@ -36,32 +42,39 @@ When you are done, call the `final_answer` tool exactly once with:
   - "answer": the answer value, matching the requested shape exactly
     (correct JSON types: string/number/bool/list/object -- not a
     stringified version of it).
-Do not include any other text as your final turn besides the tool call.
 """
 
 TOOLS = [
     {
-        "name": "run_python",
-        "description": (
-            "Execute a python3 script in a fresh subprocess (pandas, numpy, "
-            "requests, openpyxl available; internet access allowed). "
-            "Returns stdout+stderr. Use print() to see values. "
-            "State does NOT persist between calls -- re-declare variables "
-            "you need, or write intermediate results to /tmp files."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {"code": {"type": "string", "description": "Python source to run."}},
-            "required": ["code"],
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Execute a python3 script in a fresh subprocess (pandas, numpy, "
+                "requests, openpyxl available; internet access allowed). "
+                "Returns stdout+stderr. Use print() to see values. "
+                "State does NOT persist between calls -- re-declare variables "
+                "you need, or write intermediate results to /tmp files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string", "description": "Python source to run."}},
+                "required": ["code"],
+            },
         },
     },
     {
-        "name": "final_answer",
-        "description": "Submit the final answer for this question. Call exactly once, when done.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"answer": {"description": "The answer, in the exact shape requested."}},
-            "required": ["answer"],
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": "Submit the final answer for this question. Call exactly once, when done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {"description": "The answer, in the exact shape requested. Pass as a JSON value."}
+                },
+                "required": ["answer"],
+            },
         },
     },
 ]
@@ -101,48 +114,50 @@ def answer_question(history: list[dict], log_path: str) -> object:
     run_id = str(uuid.uuid4())[:8]
     _log(log_path, {"run_id": run_id, "event": "start", "history": history})
 
-    messages = [{"role": h["role"], "content": h["content"]} for h in history]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += [{"role": h["role"], "content": h["content"]} for h in history]
     max_turns = 12
 
     for turn in range(max_turns):
-        resp = CLIENT.messages.create(
+        resp = CLIENT.chat.completions.create(
             model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
             messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=4096,
         )
+        msg = resp.choices[0].message
         _log(log_path, {"run_id": run_id, "event": "model_turn", "turn": turn,
-                         "stop_reason": resp.stop_reason,
-                         "content": [b.model_dump() for b in resp.content]})
+                         "content": msg.content,
+                         "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])]})
 
-        messages.append({"role": "assistant", "content": resp.content})
+        messages.append(msg.model_dump(exclude_none=True))
 
-        if resp.stop_reason != "tool_use":
-            # Model stopped without calling final_answer -- nudge it once.
+        if not msg.tool_calls:
             messages.append({"role": "user", "content": "Please call the final_answer tool now."})
             continue
 
-        tool_results = []
         final = None
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            if block.name == "run_python":
-                result = _run_python(block.input.get("code", ""))
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+
+            if name == "run_python":
+                result = _run_python(args.get("code", ""))
                 _log(log_path, {"run_id": run_id, "event": "tool_result",
-                                 "tool": "run_python", "code": block.input.get("code", ""),
+                                 "tool": "run_python", "code": args.get("code", ""),
                                  "result": result})
-                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-            elif block.name == "final_answer":
-                final = block.input.get("answer")
-                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": "recorded"})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            elif name == "final_answer":
+                final = args.get("answer")
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": "recorded"})
 
         if final is not None:
             _log(log_path, {"run_id": run_id, "event": "final_answer", "answer": final})
             return final
-
-        messages.append({"role": "user", "content": tool_results})
 
     _log(log_path, {"run_id": run_id, "event": "error", "detail": "max turns exceeded, no final_answer"})
     return None
